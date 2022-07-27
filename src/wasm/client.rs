@@ -135,7 +135,7 @@ impl Client {
     pub fn execute(
         &self,
         request: Request,
-    ) -> impl Future<Output = Result<Response, crate::Error>> {
+    ) -> impl Future<Output = Result<Response, crate::Error>> + '_ {
         self.execute_request(request)
     }
 
@@ -155,7 +155,7 @@ impl Client {
     pub(super) fn execute_request(
         &self,
         mut req: Request,
-    ) -> impl Future<Output = crate::Result<Response>> {
+    ) -> impl Future<Output = crate::Result<Response>> + '_ {
         self.merge_headers(&mut req);
 
         // Add cookies from the cookie store.
@@ -170,7 +170,92 @@ impl Client {
             }
         }
 
-        fetch(req)
+        self.fetch(req)
+    }
+
+    async fn fetch(&self, req: Request) -> crate::Result<Response> {
+        // Build the js Request
+        let mut init = web_sys::RequestInit::new();
+        init.method(req.method().as_str());
+
+        // convert HeaderMap to Headers
+        let js_headers = web_sys::Headers::new()
+            .map_err(crate::error::wasm)
+            .map_err(crate::error::builder)?;
+
+        for (name, value) in req.headers() {
+            js_headers
+                .append(
+                    name.as_str(),
+                    value.to_str().map_err(crate::error::builder)?,
+                )
+                .map_err(crate::error::wasm)
+                .map_err(crate::error::builder)?;
+        }
+        init.headers(&js_headers.into());
+
+        // When req.cors is true, do nothing because the default mode is 'cors'
+        if !req.cors {
+            init.mode(web_sys::RequestMode::NoCors);
+        }
+
+        if let Some(creds) = req.credentials {
+            init.credentials(creds);
+        }
+
+        if let Some(body) = req.body() {
+            if !body.is_empty() {
+                init.body(Some(body.to_js_value()?.as_ref()));
+            }
+        }
+
+        let js_req = web_sys::Request::new_with_str_and_init(req.url().as_str(), &init)
+            .map_err(crate::error::wasm)
+            .map_err(crate::error::builder)?;
+
+        // Await the fetch() promise
+        let p = js_fetch(&js_req);
+        let js_resp = super::promise::<web_sys::Response>(p)
+            .await
+            .map_err(crate::error::request)?;
+
+        // Convert from the js Response
+        let mut resp = http::Response::builder().status(js_resp.status());
+
+        let url = Url::parse(&js_resp.url()).expect_throw("url parse");
+
+        let js_headers = js_resp.headers();
+        let js_iter = js_sys::try_iter(&js_headers)
+            .expect_throw("headers try_iter")
+            .expect_throw("headers have an iterator");
+
+        for item in js_iter {
+            let item = item.expect_throw("headers iterator doesn't throw");
+            let serialized_headers: String = JSON::stringify(&item)
+                .expect_throw("serialized headers")
+                .into();
+            let [name, value]: [String; 2] = serde_json::from_str(&serialized_headers)
+                .expect_throw("deserializable serialized headers");
+            resp = resp.header(&name, &value);
+        }
+
+        #[cfg(feature = "cookies")]
+        {
+            if let Some(ref cookie_store) = self.config.cookie_store {
+                if let Some(ref headers) = resp.headers_mut() {
+                    let mut cookies =
+                        cookie::extract_response_cookie_headers(headers).peekable();
+                    if cookies.peek().is_some() {
+                        cookie_store.set_cookies(&mut cookies, &url);
+                    }
+                }
+
+            }
+        }
+
+        resp.body(js_resp)
+            .map(|resp| Response::new(resp, url))
+            .map_err(crate::error::request)
     }
 }
 
@@ -194,77 +279,6 @@ impl fmt::Debug for ClientBuilder {
         self.config.fmt_fields(&mut builder);
         builder.finish()
     }
-}
-
-async fn fetch(req: Request) -> crate::Result<Response> {
-    // Build the js Request
-    let mut init = web_sys::RequestInit::new();
-    init.method(req.method().as_str());
-
-    // convert HeaderMap to Headers
-    let js_headers = web_sys::Headers::new()
-        .map_err(crate::error::wasm)
-        .map_err(crate::error::builder)?;
-
-    for (name, value) in req.headers() {
-        js_headers
-            .append(
-                name.as_str(),
-                value.to_str().map_err(crate::error::builder)?,
-            )
-            .map_err(crate::error::wasm)
-            .map_err(crate::error::builder)?;
-    }
-    init.headers(&js_headers.into());
-
-    // When req.cors is true, do nothing because the default mode is 'cors'
-    if !req.cors {
-        init.mode(web_sys::RequestMode::NoCors);
-    }
-
-    if let Some(creds) = req.credentials {
-        init.credentials(creds);
-    }
-
-    if let Some(body) = req.body() {
-        if !body.is_empty() {
-            init.body(Some(body.to_js_value()?.as_ref()));
-        }
-    }
-
-    let js_req = web_sys::Request::new_with_str_and_init(req.url().as_str(), &init)
-        .map_err(crate::error::wasm)
-        .map_err(crate::error::builder)?;
-
-    // Await the fetch() promise
-    let p = js_fetch(&js_req);
-    let js_resp = super::promise::<web_sys::Response>(p)
-        .await
-        .map_err(crate::error::request)?;
-
-    // Convert from the js Response
-    let mut resp = http::Response::builder().status(js_resp.status());
-
-    let url = Url::parse(&js_resp.url()).expect_throw("url parse");
-
-    let js_headers = js_resp.headers();
-    let js_iter = js_sys::try_iter(&js_headers)
-        .expect_throw("headers try_iter")
-        .expect_throw("headers have an iterator");
-
-    for item in js_iter {
-        let item = item.expect_throw("headers iterator doesn't throw");
-        let serialized_headers: String = JSON::stringify(&item)
-            .expect_throw("serialized headers")
-            .into();
-        let [name, value]: [String; 2] = serde_json::from_str(&serialized_headers)
-            .expect_throw("deserializable serialized headers");
-        resp = resp.header(&name, &value);
-    }
-
-    resp.body(js_resp)
-        .map(|resp| Response::new(resp, url))
-        .map_err(crate::error::request)
 }
 
 // ===== impl ClientBuilder =====

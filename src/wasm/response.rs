@@ -5,6 +5,9 @@ use http::{HeaderMap, StatusCode};
 use js_sys::Uint8Array;
 use url::Url;
 
+#[cfg(feature = "cookies")]
+use crate::cookie;
+
 #[cfg(feature = "json")]
 use serde::de::DeserializeOwned;
 
@@ -57,6 +60,20 @@ impl Response {
             .parse()
             .ok()
     }
+
+    /// Retrieve the cookies contained in the response.
+    ///
+    /// Note that invalid 'Set-Cookie' headers will be ignored.
+    ///
+    /// # Optional
+    ///
+    /// This requires the optional `cookies` feature to be enabled.
+    #[cfg(feature = "cookies")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cookies")))]
+    pub fn cookies<'a>(&'a self) -> impl Iterator<Item = cookie::Cookie<'a>> + 'a {
+        cookie::extract_response_cookies(&self.headers()).filter_map(Result::ok)
+    }
+
 
     /// Get the final `Url` of this `Response`.
     #[inline]
