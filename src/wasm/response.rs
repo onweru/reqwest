@@ -74,7 +74,6 @@ impl Response {
         cookie::extract_response_cookies(&self.headers()).filter_map(Result::ok)
     }
 
-
     /// Get the final `Url` of this `Response`.
     #[inline]
     pub fn url(&self) -> &Url {
@@ -106,7 +105,7 @@ impl Response {
             .text()
             .map_err(crate::error::wasm)
             .map_err(crate::error::decode)?;
-        let js_val = super::promise::<wasm_bindgen::JsValue>(p)
+        let (js_val, _) = super::promise::<wasm_bindgen::JsValue>(p)
             .await
             .map_err(crate::error::decode)?;
         if let Some(s) = js_val.as_string() {
@@ -125,7 +124,7 @@ impl Response {
             .map_err(crate::error::wasm)
             .map_err(crate::error::decode)?;
 
-        let buf_js = super::promise::<wasm_bindgen::JsValue>(p)
+        let (buf_js, _) = super::promise::<wasm_bindgen::JsValue>(p)
             .await
             .map_err(crate::error::decode)?;
 

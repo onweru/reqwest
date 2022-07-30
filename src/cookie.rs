@@ -3,8 +3,6 @@
 use std::convert::TryInto;
 use std::fmt;
 use std::sync::RwLock;
-
-#[cfg(not(target_arch = "wasm32"))]
 use std::time::SystemTime;
 
 #[allow(unused)]
@@ -86,7 +84,6 @@ impl<'a> Cookie<'a> {
     }
 
     /// Get the Max-Age information.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn max_age(&self) -> Option<std::time::Duration> {
         self.0.max_age().map(|d| {
             d.try_into()
@@ -95,7 +92,6 @@ impl<'a> Cookie<'a> {
     }
 
     /// The cookie expiration time.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn expires(&self) -> Option<SystemTime> {
         match self.0.expires() {
             Some(cookie_crate::Expiration::DateTime(offset)) => Some(SystemTime::from(offset)),

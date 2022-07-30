@@ -3,6 +3,7 @@ use js_sys::{Promise, JSON};
 use std::{fmt, future::Future, sync::Arc};
 use url::Url;
 use wasm_bindgen::prelude::{wasm_bindgen, UnwrapThrowExt as _};
+use wasm_bindgen::{JsCast, JsValue};
 
 #[cfg(feature = "cookies")]
 use crate::cookie;
@@ -12,6 +13,11 @@ use crate::IntoUrl;
 
 #[wasm_bindgen]
 extern "C" {
+    type Headers;
+
+    #[wasm_bindgen(catch, method)]
+    fn raw(this: &Headers) -> Result<js_sys::Object, JsValue>;
+
     #[wasm_bindgen(js_name = fetch)]
     fn fetch_with_request(input: &web_sys::Request) -> Promise;
 }
@@ -215,7 +221,7 @@ impl Client {
 
         // Await the fetch() promise
         let p = js_fetch(&js_req);
-        let js_resp = super::promise::<web_sys::Response>(p)
+        let (js_resp, js_value) = super::promise::<web_sys::Response>(p)
             .await
             .map_err(crate::error::request)?;
 
@@ -224,32 +230,46 @@ impl Client {
 
         let url = Url::parse(&js_resp.url()).expect_throw("url parse");
 
-        let js_headers = js_resp.headers();
-        let js_iter = js_sys::try_iter(&js_headers)
-            .expect_throw("headers try_iter")
-            .expect_throw("headers have an iterator");
+        let js_iter: Vec<JsValue> = js_sys::Reflect::get(&js_value, &JsValue::from_str("headers"))
+            .and_then(|headers: JsValue| headers.dyn_into::<Headers>())
+            .and_then(|headers: Headers| headers.raw())
+            .map(|headers: js_sys::Object| js_sys::Object::entries(&headers).to_vec())
+            .unwrap_or_else(|_| {
+                js_sys::try_iter(&js_resp.headers())
+                    .expect_throw("headers try_iter")
+                    .expect_throw("headers have an iterator")
+                    .map(|item| item.expect_throw("headers iterator doesn't throw").into())
+                    .collect()
+            });
 
         for item in js_iter {
-            let item = item.expect_throw("headers iterator doesn't throw");
             let serialized_headers: String = JSON::stringify(&item)
                 .expect_throw("serialized headers")
                 .into();
-            let [name, value]: [String; 2] = serde_json::from_str(&serialized_headers)
-                .expect_throw("deserializable serialized headers");
-            resp = resp.header(&name, &value);
+
+            match serde_json::from_str::<[String; 2]>(&serialized_headers) {
+                Ok([name, value]) => resp = resp.header(&name, &value),
+                Err(_) => {
+                    let (name, values) =
+                        serde_json::from_str::<(String, Vec<String>)>(&serialized_headers)
+                            .expect_throw("deserializable serialized headers");
+
+                    for value in values {
+                        resp = resp.header(&name, &value);
+                    }
+                }
+            }
         }
 
         #[cfg(feature = "cookies")]
         {
             if let Some(ref cookie_store) = self.config.cookie_store {
                 if let Some(ref headers) = resp.headers_mut() {
-                    let mut cookies =
-                        cookie::extract_response_cookie_headers(headers).peekable();
+                    let mut cookies = cookie::extract_response_cookie_headers(headers).peekable();
                     if cookies.peek().is_some() {
                         cookie_store.set_cookies(&mut cookies, &url);
                     }
                 }
-
             }
         }
 
