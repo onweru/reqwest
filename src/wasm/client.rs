@@ -3,12 +3,21 @@ use js_sys::{Promise, JSON};
 use std::{fmt, future::Future, sync::Arc};
 use url::Url;
 use wasm_bindgen::prelude::{wasm_bindgen, UnwrapThrowExt as _};
+use wasm_bindgen::{JsCast, JsValue};
+
+#[cfg(feature = "cookies")]
+use crate::cookie;
 
 use super::{Request, RequestBuilder, Response};
 use crate::IntoUrl;
 
 #[wasm_bindgen]
 extern "C" {
+    type Headers;
+
+    #[wasm_bindgen(catch, method)]
+    fn raw(this: &Headers) -> Result<js_sys::Object, JsValue>;
+
     #[wasm_bindgen(js_name = fetch)]
     fn fetch_with_request(input: &web_sys::Request) -> Promise;
 }
@@ -132,7 +141,7 @@ impl Client {
     pub fn execute(
         &self,
         request: Request,
-    ) -> impl Future<Output = Result<Response, crate::Error>> {
+    ) -> impl Future<Output = Result<Response, crate::Error>> + '_ {
         self.execute_request(request)
     }
 
@@ -152,9 +161,121 @@ impl Client {
     pub(super) fn execute_request(
         &self,
         mut req: Request,
-    ) -> impl Future<Output = crate::Result<Response>> {
+    ) -> impl Future<Output = crate::Result<Response>> + '_ {
         self.merge_headers(&mut req);
-        fetch(req)
+
+        // Add cookies from the cookie store.
+        #[cfg(feature = "cookies")]
+        {
+            if let Some(cookie_store) = self.config.cookie_store.as_ref() {
+                if req.headers.get(crate::header::COOKIE).is_none() {
+                    if let Some(header) = cookie_store.cookies(req.url()) {
+                        req.headers.insert(crate::header::COOKIE, header);
+                    }
+                }
+            }
+        }
+
+        self.fetch(req)
+    }
+
+    async fn fetch(&self, req: Request) -> crate::Result<Response> {
+        // Build the js Request
+        let mut init = web_sys::RequestInit::new();
+        init.method(req.method().as_str());
+
+        // convert HeaderMap to Headers
+        let js_headers = web_sys::Headers::new()
+            .map_err(crate::error::wasm)
+            .map_err(crate::error::builder)?;
+
+        for (name, value) in req.headers() {
+            js_headers
+                .append(
+                    name.as_str(),
+                    value.to_str().map_err(crate::error::builder)?,
+                )
+                .map_err(crate::error::wasm)
+                .map_err(crate::error::builder)?;
+        }
+        init.headers(&js_headers.into());
+
+        // When req.cors is true, do nothing because the default mode is 'cors'
+        if !req.cors {
+            init.mode(web_sys::RequestMode::NoCors);
+        }
+
+        if let Some(creds) = req.credentials {
+            init.credentials(creds);
+        }
+
+        if let Some(body) = req.body() {
+            if !body.is_empty() {
+                init.body(Some(body.to_js_value()?.as_ref()));
+            }
+        }
+
+        let js_req = web_sys::Request::new_with_str_and_init(req.url().as_str(), &init)
+            .map_err(crate::error::wasm)
+            .map_err(crate::error::builder)?;
+
+        // Await the fetch() promise
+        let p = js_fetch(&js_req);
+        let (js_resp, js_value) = super::promise::<web_sys::Response>(p)
+            .await
+            .map_err(crate::error::request)?;
+
+        // Convert from the js Response
+        let mut resp = http::Response::builder().status(js_resp.status());
+
+        let url = Url::parse(&js_resp.url()).expect_throw("url parse");
+
+        let js_iter: Vec<JsValue> = js_sys::Reflect::get(&js_value, &JsValue::from_str("headers"))
+            .and_then(|headers: JsValue| headers.dyn_into::<Headers>())
+            .and_then(|headers: Headers| headers.raw())
+            .map(|headers: js_sys::Object| js_sys::Object::entries(&headers).to_vec())
+            .unwrap_or_else(|_| {
+                js_sys::try_iter(&js_resp.headers())
+                    .expect_throw("headers try_iter")
+                    .expect_throw("headers have an iterator")
+                    .map(|item| item.expect_throw("headers iterator doesn't throw").into())
+                    .collect()
+            });
+
+        for item in js_iter {
+            let serialized_headers: String = JSON::stringify(&item)
+                .expect_throw("serialized headers")
+                .into();
+
+            match serde_json::from_str::<[String; 2]>(&serialized_headers) {
+                Ok([name, value]) => resp = resp.header(&name, &value),
+                Err(_) => {
+                    let (name, values) =
+                        serde_json::from_str::<(String, Vec<String>)>(&serialized_headers)
+                            .expect_throw("deserializable serialized headers");
+
+                    for value in values {
+                        resp = resp.header(&name, &value);
+                    }
+                }
+            }
+        }
+
+        #[cfg(feature = "cookies")]
+        {
+            if let Some(ref cookie_store) = self.config.cookie_store {
+                if let Some(ref headers) = resp.headers_mut() {
+                    let mut cookies = cookie::extract_response_cookie_headers(headers).peekable();
+                    if cookies.peek().is_some() {
+                        cookie_store.set_cookies(&mut cookies, &url);
+                    }
+                }
+            }
+        }
+
+        resp.body(js_resp)
+            .map(|resp| Response::new(resp, url))
+            .map_err(crate::error::request)
     }
 }
 
@@ -180,77 +301,6 @@ impl fmt::Debug for ClientBuilder {
     }
 }
 
-async fn fetch(req: Request) -> crate::Result<Response> {
-    // Build the js Request
-    let mut init = web_sys::RequestInit::new();
-    init.method(req.method().as_str());
-
-    // convert HeaderMap to Headers
-    let js_headers = web_sys::Headers::new()
-        .map_err(crate::error::wasm)
-        .map_err(crate::error::builder)?;
-
-    for (name, value) in req.headers() {
-        js_headers
-            .append(
-                name.as_str(),
-                value.to_str().map_err(crate::error::builder)?,
-            )
-            .map_err(crate::error::wasm)
-            .map_err(crate::error::builder)?;
-    }
-    init.headers(&js_headers.into());
-
-    // When req.cors is true, do nothing because the default mode is 'cors'
-    if !req.cors {
-        init.mode(web_sys::RequestMode::NoCors);
-    }
-
-    if let Some(creds) = req.credentials {
-        init.credentials(creds);
-    }
-
-    if let Some(body) = req.body() {
-        if !body.is_empty() {
-            init.body(Some(body.to_js_value()?.as_ref()));
-        }
-    }
-
-    let js_req = web_sys::Request::new_with_str_and_init(req.url().as_str(), &init)
-        .map_err(crate::error::wasm)
-        .map_err(crate::error::builder)?;
-
-    // Await the fetch() promise
-    let p = js_fetch(&js_req);
-    let js_resp = super::promise::<web_sys::Response>(p)
-        .await
-        .map_err(crate::error::request)?;
-
-    // Convert from the js Response
-    let mut resp = http::Response::builder().status(js_resp.status());
-
-    let url = Url::parse(&js_resp.url()).expect_throw("url parse");
-
-    let js_headers = js_resp.headers();
-    let js_iter = js_sys::try_iter(&js_headers)
-        .expect_throw("headers try_iter")
-        .expect_throw("headers have an iterator");
-
-    for item in js_iter {
-        let item = item.expect_throw("headers iterator doesn't throw");
-        let serialized_headers: String = JSON::stringify(&item)
-            .expect_throw("serialized headers")
-            .into();
-        let [name, value]: [String; 2] = serde_json::from_str(&serialized_headers)
-            .expect_throw("deserializable serialized headers");
-        resp = resp.header(&name, &value);
-    }
-
-    resp.body(js_resp)
-        .map(|resp| Response::new(resp, url))
-        .map_err(crate::error::request)
-}
-
 // ===== impl ClientBuilder =====
 
 impl ClientBuilder {
@@ -261,12 +311,45 @@ impl ClientBuilder {
         }
     }
 
-    /// Returns a 'Client' that uses this ClientBuilder configuration
-    pub fn build(mut self) -> Result<Client, crate::Error> {
-        let config = std::mem::take(&mut self.config);
-        Ok(Client {
-            config: Arc::new(config),
-        })
+    /// Enable a persistent cookie store for the client.
+    ///
+    /// Cookies received in responses will be preserved and included in
+    /// additional requests.
+    ///
+    /// By default, no cookie store is used.
+    ///
+    /// # Optional
+    ///
+    /// This requires the optional `cookies` feature to be enabled.
+    #[cfg(feature = "cookies")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cookies")))]
+    pub fn cookie_store(mut self, enable: bool) -> ClientBuilder {
+        if enable {
+            self.cookie_provider(Arc::new(cookie::Jar::default()))
+        } else {
+            self.config.cookie_store = None;
+            self
+        }
+    }
+
+    /// Set the persistent cookie store for the client.
+    ///
+    /// Cookies received in responses will be passed to this store, and
+    /// additional requests will query this store for cookies.
+    ///
+    /// By default, no cookie store is used.
+    ///
+    /// # Optional
+    ///
+    /// This requires the optional `cookies` feature to be enabled.
+    #[cfg(feature = "cookies")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cookies")))]
+    pub fn cookie_provider<C: cookie::CookieStore + 'static>(
+        mut self,
+        cookie_store: Arc<C>,
+    ) -> ClientBuilder {
+        self.config.cookie_store = Some(cookie_store as _);
+        self
     }
 
     /// Sets the default headers for every request
@@ -276,6 +359,14 @@ impl ClientBuilder {
         }
         self
     }
+
+    /// Returns a 'Client' that uses this ClientBuilder configuration
+    pub fn build(mut self) -> Result<Client, crate::Error> {
+        let config = std::mem::take(&mut self.config);
+        Ok(Client {
+            config: Arc::new(config),
+        })
+    }
 }
 
 impl Default for ClientBuilder {
@@ -284,15 +375,30 @@ impl Default for ClientBuilder {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct Config {
     headers: HeaderMap,
+    #[cfg(feature = "cookies")]
+    cookie_store: Option<Arc<dyn cookie::CookieStore>>,
+}
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let mut build = f.debug_struct("Config");
+
+        if cfg!(feature = "cookies") {
+            build.field("cookie_store", &self.cookie_store.is_some());
+        }
+
+        build.field("headers", &self.headers).finish()
+    }
 }
 
 impl Default for Config {
     fn default() -> Config {
         Config {
             headers: HeaderMap::new(),
+            #[cfg(feature = "cookies")]
+            cookie_store: None,
         }
     }
 }

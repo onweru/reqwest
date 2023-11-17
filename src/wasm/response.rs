@@ -5,6 +5,9 @@ use http::{HeaderMap, StatusCode};
 use js_sys::Uint8Array;
 use url::Url;
 
+#[cfg(feature = "cookies")]
+use crate::cookie;
+
 #[cfg(feature = "json")]
 use serde::de::DeserializeOwned;
 
@@ -58,6 +61,19 @@ impl Response {
             .ok()
     }
 
+    /// Retrieve the cookies contained in the response.
+    ///
+    /// Note that invalid 'Set-Cookie' headers will be ignored.
+    ///
+    /// # Optional
+    ///
+    /// This requires the optional `cookies` feature to be enabled.
+    #[cfg(feature = "cookies")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cookies")))]
+    pub fn cookies<'a>(&'a self) -> impl Iterator<Item = cookie::Cookie<'a>> + 'a {
+        cookie::extract_response_cookies(&self.headers()).filter_map(Result::ok)
+    }
+
     /// Get the final `Url` of this `Response`.
     #[inline]
     pub fn url(&self) -> &Url {
@@ -89,7 +105,7 @@ impl Response {
             .text()
             .map_err(crate::error::wasm)
             .map_err(crate::error::decode)?;
-        let js_val = super::promise::<wasm_bindgen::JsValue>(p)
+        let (js_val, _) = super::promise::<wasm_bindgen::JsValue>(p)
             .await
             .map_err(crate::error::decode)?;
         if let Some(s) = js_val.as_string() {
@@ -108,7 +124,7 @@ impl Response {
             .map_err(crate::error::wasm)
             .map_err(crate::error::decode)?;
 
-        let buf_js = super::promise::<wasm_bindgen::JsValue>(p)
+        let (buf_js, _) = super::promise::<wasm_bindgen::JsValue>(p)
             .await
             .map_err(crate::error::decode)?;
 
