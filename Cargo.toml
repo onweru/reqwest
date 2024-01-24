@@ -93,7 +93,7 @@ serde_json = { version = "1.0", optional = true }
 mime_guess = { version = "2.0", default-features = false, optional = true }
 
 ## cookies
-cookie_crate = { package = "cookie", git = "https://github.com/jeanmertz/cookie-rs", rev = "48ba15ad56ff8a9e5d65e89d0e3d09abbe2bda37", optional = true }
+cookie_crate = { version = "0.18.0", package = "cookie", optional = true }
 cookie_store = "0.20.0"
 proc-macro-hack = { version = "0.5.19", optional = true }
 
