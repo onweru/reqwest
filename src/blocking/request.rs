@@ -152,6 +152,10 @@ impl Request {
 }
 
 impl RequestBuilder {
+    pub fn fetch_credentials_include(mut self) -> RequestBuilder {
+      self
+    }
+
     pub(crate) fn new(client: Client, request: crate::Result<Request>) -> RequestBuilder {
         let mut builder = RequestBuilder { client, request };
 

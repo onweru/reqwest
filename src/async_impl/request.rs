@@ -163,6 +163,10 @@ impl Request {
 }
 
 impl RequestBuilder {
+    pub fn fetch_credentials_include(self) -> RequestBuilder {
+        self
+    }
+
     pub(super) fn new(client: Client, request: crate::Result<Request>) -> RequestBuilder {
         let mut builder = RequestBuilder { client, request };
 
